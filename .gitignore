@@ -1,5 +1,9 @@
 *.pyc
 __pycache__/
 venv/
-*.txt
 *.json
+
+google_client_secret.json
+google_api_key.txt
+slack_bot_user_oauth_token.txt
+latest_message_timestamp.txt
