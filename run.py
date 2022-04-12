@@ -23,11 +23,8 @@ def read_key(path):
         return f.read().strip()
 
 
-GOOGLE_YT_DATA_API_KEY = read_key('api_key.txt')
-CLIENT_SECRETS_FILE = (
-    'client_secret_236644726255-gqps0ipoe5km2b80gbjhf9fp0oq9q9cm'
-    '.apps.googleusercontent.com.json'
-)
+GOOGLE_YT_DATA_API_KEY = read_key('google_api_key.txt')
+CLIENT_SECRETS_FILE = 'google_client_secret.json'
 # YT_API_SCOPES = ['https://www.googleapis.com/auth/youtube.readonly']
 YT_API_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 
