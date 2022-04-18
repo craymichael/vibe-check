@@ -5,11 +5,14 @@
 import os
 import time
 import threading
-# import warnings
+import warnings
 import re
+from datetime import timedelta
+from decimal import Decimal
 
 import google_auth_oauthlib.flow
 import googleapiclient.discovery
+import googleapiclient.discovery_cache
 import googleapiclient.errors
 
 import slack_sdk
@@ -45,6 +48,7 @@ TIMESTAMP_PATH = 'latest_message_timestamp.txt'
 YT_REGEX = re.compile(r'(?:youtube\.com/watch\?v=|youtu\.be/)([0-9A-Za-z_-]+)')
 
 VIBE_CHECK_PLAYLIST_ID = 'PLzvmpzXLAktitNV3k0LguHX9s7_k3q1j0'
+VIBE_CHECK_PLAYLIST_ID_LONG = 'PLzvmpzXLAktiaojjoPTOJZ7E0WzpXkYmq'
 
 
 def build_yt_client():
@@ -61,7 +65,10 @@ def build_yt_client():
             CLIENT_SECRETS_FILE, YT_API_SCOPES)
         credentials = flow.run_console()
         youtube = googleapiclient.discovery.build(
-            api_service_name, api_version, credentials=credentials)
+            api_service_name, api_version, credentials=credentials,
+            cache_discovery=True,
+            cache=googleapiclient.discovery_cache.autodetect(),
+        )
     else:
         youtube = googleapiclient.discovery.build(
             api_service_name, api_version, developerKey=GOOGLE_YT_DATA_API_KEY)
@@ -71,59 +78,6 @@ def build_yt_client():
 def build_slack_client():
     slack = slack_sdk.WebClient(token=SLACK_BOT_TOKEN)
     return slack
-
-
-def handle_message(message, youtube):
-    video_ids = YT_REGEX.findall(message['text'])
-    for video_id in sorted(set(video_ids)):  # unique video IDs
-        print('YT', video_id)
-
-        try:
-            youtube.playlistItems().insert(
-                part='snippet',
-                body={
-                    'snippet': {
-                        'playlistId': VIBE_CHECK_PLAYLIST_ID,
-                        'resourceId': {
-                            'kind': 'youtube#video',
-                            'videoId': video_id
-                        },
-                        'position': 0,
-                    }
-                }
-            ).execute()
-        except googleapiclient.errors.HttpError as e:
-            # googleapiclient.errors.HttpError: <HttpError 404 when requesting
-            #  https://youtube.googleapis.com/youtube/v3/playlistItems?part=snippet&alt=json
-            #  returned "Video not found.". Details: "[{'message': 'Video not
-            #  found.', 'domain': 'youtube.playlistItem', 'reason':
-            #  'videoNotFound'}]">
-            # Broken: akuVjWjEYFs <HttpError 403 when requesting
-            #  https://youtube.googleapis.com/youtube/v3/playlistItems?part=snippet&alt=json
-            #  returned "The request cannot be completed because you have
-            #  exceeded your
-            #  <a href="/youtube/v3/getting-started#quota">quota</a>.". Details:
-            #  "[{'message': 'The request cannot be completed because you have
-            #  exceeded your
-            #  <a href="/youtube/v3/getting-started#quota">quota</a>.',
-            # 'domain': 'youtube.quota', 'reason': 'quotaExceeded'}]">
-            print(f'  Broken: {video_id}\n{e}')
-            if e.status_code == 403:
-                raise
-
-    with TIMESTAMP_LOCK:
-        with open(TIMESTAMP_PATH, 'r') as f:
-            timestamp = f.read()
-        message_timestamp = message['ts']
-        if float(timestamp) > float(message_timestamp):
-            pass
-            # warnings.warn(f'{TIMESTAMP_PATH} contains timestamp={timestamp} '
-            #               f'but message contains older timestamp '
-            #               f'{message_timestamp}. This should never happen '
-            #               f'and we will not update the timestamp in the file.')
-        else:
-            with open(TIMESTAMP_PATH, 'w') as f:
-                f.write(message_timestamp)
 
 
 def read_timestamp():
@@ -176,19 +130,125 @@ def retrieve_slack_history(slack, last_timestamp):
     return messages
 
 
+ISO8601_PERIOD_REGEX = re.compile(
+    r'^(?P<sign>[+-])?'
+    r'P(?!\b)'
+    r'(?P<years>\d+([,.]\d+)?Y)?'
+    r'(?P<months>\d+([,.]\d+)?M)?'
+    r'(?P<weeks>\d+([,.]\d+)?W)?'
+    r'(?P<days>\d+([,.]\d+)?D)?'
+    r'((?P<separator>T)(?P<hours>\d+([,.]\d+)?H)?'
+    r'(?P<minutes>\d+([,.]\d+)?M)?'
+    r'(?P<seconds>\d+([,.]\d+)?S)?)?$'
+)
+
+
+class VideoDoesNotExistError(ValueError):
+    pass
+
+
+class InvalidDurationError(ValueError):
+    pass
+
+
+def get_video_duration(youtube, video_id):
+    request = youtube.videos().list(
+        part='contentDetails',
+        id=video_id,
+    )
+    response = request.execute()
+    if len(response['items']) != 1:
+        raise VideoDoesNotExistError(f'{video_id} does not exist or is not '
+                                     f'public')
+    duration_str = response['items'][0]['contentDetails']['duration']
+    duration_match = ISO8601_PERIOD_REGEX.match(duration_str)
+    if duration_match is None:
+        raise InvalidDurationError(duration_str)
+    duration_dict = duration_match.groupdict()
+    for key, val in duration_dict.items():
+        if key not in ('separator', 'sign'):
+            if val is None:
+                val = '0n'
+            val = val[:-1].replace(',', '.')
+            if key in {'years', 'months'}:
+                duration_dict[key] = float(Decimal(val))
+            else:
+                duration_dict[key] = float(val)
+
+    extra_days = 0
+    if duration_dict['years'] != 0:
+        extra_days_from_years = 365 * duration_dict['years']
+        warnings.warn(f'video_id {video_id} has duration that specified '
+                      f'years={duration_dict["years"]}, which we will say is '
+                      f'equivalent to {extra_days_from_years} days.')
+        extra_days += extra_days_from_years
+    if duration_dict['months'] != 0:
+        extra_days_from_months = (365 / 12) * duration_dict['months']
+        warnings.warn(f'video_id {video_id} has duration that specified '
+                      f'months={duration_dict["months"]}, which we will say is '
+                      f'equivalent to {extra_days_from_months} days.')
+        extra_days += extra_days_from_months
+    duration_secs = timedelta(
+        weeks=duration_dict['weeks'],
+        days=duration_dict['days'] + extra_days,
+        hours=duration_dict['hours'],
+        minutes=duration_dict['minutes'],
+        seconds=duration_dict['seconds'],
+    ).seconds
+    return duration_secs
+
+
+def handle_message(message, youtube):
+    video_ids = YT_REGEX.findall(message['text'])
+    for video_id in sorted(set(video_ids)):  # unique video IDs
+        print('YT', video_id)
+
+        try:
+            duration = get_video_duration(youtube, video_id)
+            if duration > (60 * 30):
+                playlist_id = VIBE_CHECK_PLAYLIST_ID_LONG
+            else:
+                playlist_id = VIBE_CHECK_PLAYLIST_ID
+            youtube.playlistItems().insert(
+                part='snippet',
+                body={
+                    'snippet': {
+                        'playlistId': playlist_id,
+                        'resourceId': {
+                            'kind': 'youtube#video',
+                            'videoId': video_id
+                        },
+                        'position': 0,
+                    }
+                }
+            ).execute()
+        except googleapiclient.errors.HttpError as e:
+            warnings.warn(f'  Broken: {video_id}\n{e}')
+            if e.status_code == 403:
+                raise
+        except (VideoDoesNotExistError, InvalidDurationError) as e:
+            warnings.warn(f'Video duration parsing error:\n{e}')
+
+    with TIMESTAMP_LOCK:
+        with open(TIMESTAMP_PATH, 'r') as f:
+            timestamp = f.read()
+        message_timestamp = message['ts']
+        if float(timestamp) > float(message_timestamp):
+            warnings.warn(f'{TIMESTAMP_PATH} contains timestamp={timestamp} '
+                          f'but message contains older timestamp '
+                          f'{message_timestamp}. This should never happen '
+                          f'and we will not update the timestamp in the file.')
+        else:
+            with open(TIMESTAMP_PATH, 'w') as f:
+                f.write(message_timestamp)
+
+
 def main():
     if not os.path.exists(TIMESTAMP_PATH):
         write_timestamp('0')
 
     youtube = build_yt_client()
     slack = build_slack_client()
-
-    # request = youtube.channels().list(
-    #     part='snippet,contentDetails,statistics',
-    #     forUsername='ZachCarmichael',
-    # )
-    # response = request.execute()
-    # print(response)
 
     while True:
         last_timestamp = read_timestamp()
