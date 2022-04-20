@@ -5,12 +5,15 @@
 import os
 import time
 import threading
-import warnings
 import re
+import logging
+import json
 from datetime import timedelta
 from decimal import Decimal
 
-import google_auth_oauthlib.flow
+import urllib.error
+
+import pydata_google_auth
 import googleapiclient.discovery
 import googleapiclient.discovery_cache
 import googleapiclient.errors
@@ -26,9 +29,16 @@ def read_key(path):
         return f.read().strip()
 
 
+def read_client_secrets(path):
+    with open(path, 'r') as f:
+        data = json.load(f)['installed']
+    return data['client_id'], data['client_secret']
+
+
 GOOGLE_YT_DATA_API_KEY = read_key('google_api_key.txt')
-CLIENT_SECRETS_FILE = 'google_client_secret.json'
-# YT_API_SCOPES = ['https://www.googleapis.com/auth/youtube.readonly']
+# CLIENT_SECRETS_FILE = 'google_client_secret.json'
+GOOGLE_APP_CLIENT_ID, GOOGLE_APP_CLIENT_SECRET = read_client_secrets(
+    'google_client_secret.json')
 YT_API_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
 
 SLACK_BOT_TOKEN = read_key('slack_bot_user_oauth_token.txt')
@@ -45,25 +55,35 @@ TIMESTAMP_PATH = 'latest_message_timestamp.txt'
 # https://www.youtube.com/watch?v=RanWHeHgH0k
 # https://www.youtube.com/watch?v=RanWHeHgH0k&list=PLzvmpzXLAkthyaiDbI6c_35KDZ1bu5Fp-&index=9
 # https://youtu.be/RanWHeHgH0k
-YT_REGEX = re.compile(r'(?:youtube\.com/watch\?v=|youtu\.be/)([0-9A-Za-z_-]+)')
+YT_REGEX = re.compile(r'(?:youtube\.com/watch\?v=|youtu\.be/)([\dA-Za-z_-]+)')
 
 VIBE_CHECK_PLAYLIST_ID = 'PLzvmpzXLAktitNV3k0LguHX9s7_k3q1j0'
 VIBE_CHECK_PLAYLIST_ID_LONG = 'PLzvmpzXLAktiaojjoPTOJZ7E0WzpXkYmq'
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s.%(msecs)03d %(levelname)s %(module)s - %(funcName)s: '
+           '%(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+)
+logger = logging.getLogger('run')
 
 
 def build_yt_client():
     # Disable OAuthlib's HTTPS verification when running locally.
     # *DO NOT* leave this option enabled in production.
-    os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+    # os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
 
     api_service_name = 'youtube'
     api_version = 'v3'
 
     # Get credentials and create an API client
     if OAUTH:
-        flow = google_auth_oauthlib.flow.InstalledAppFlow.from_client_secrets_file(
-            CLIENT_SECRETS_FILE, YT_API_SCOPES)
-        credentials = flow.run_console()
+        credentials = pydata_google_auth.get_user_credentials(
+            scopes=YT_API_SCOPES,
+            client_id=GOOGLE_APP_CLIENT_ID,
+            client_secret=GOOGLE_APP_CLIENT_SECRET,
+        )
         youtube = googleapiclient.discovery.build(
             api_service_name, api_version, credentials=credentials,
             cache_discovery=True,
@@ -111,11 +131,17 @@ def retrieve_slack_history(slack, last_timestamp):
             assert e.response['error']
             if e.response.status_code == 429:
                 delay = int(e.response.headers['Retry-After'])
-                print(f'Rate limited. Retrying in {delay} seconds')
+                logger.warning(f'Rate limited. Retrying in {delay} seconds')
                 time.sleep(delay)
             else:
                 # other errors
-                print(f'Got an error: {e.response["error"]}')
+                logger.error(f'Got an error: {e.response["error"]}')
+                raise e
+        except urllib.error.URLError as e:
+            if re.match(r'timed out', e.reason):
+                logger.warning('Connection timed out, sleeping for a minute')
+                time.sleep(60)
+            else:
                 raise e
         else:
             assert response['ok']
@@ -178,15 +204,15 @@ def get_video_duration(youtube, video_id):
     extra_days = 0
     if duration_dict['years'] != 0:
         extra_days_from_years = 365 * duration_dict['years']
-        warnings.warn(f'video_id {video_id} has duration that specified '
-                      f'years={duration_dict["years"]}, which we will say is '
-                      f'equivalent to {extra_days_from_years} days.')
+        logger.warning(f'video_id {video_id} has duration that specified '
+                       f'years={duration_dict["years"]}, which we will say is '
+                       f'equivalent to {extra_days_from_years} days.')
         extra_days += extra_days_from_years
     if duration_dict['months'] != 0:
         extra_days_from_months = (365 / 12) * duration_dict['months']
-        warnings.warn(f'video_id {video_id} has duration that specified '
-                      f'months={duration_dict["months"]}, which we will say is '
-                      f'equivalent to {extra_days_from_months} days.')
+        logger.warning(f'video_id {video_id} has duration that specified '
+                       f'months={duration_dict["months"]}, which we will say '
+                       f'is equivalent to {extra_days_from_months} days.')
         extra_days += extra_days_from_months
     duration_secs = timedelta(
         weeks=duration_dict['weeks'],
@@ -201,7 +227,7 @@ def get_video_duration(youtube, video_id):
 def handle_message(message, youtube):
     video_ids = YT_REGEX.findall(message['text'])
     for video_id in sorted(set(video_ids)):  # unique video IDs
-        print('YT', video_id)
+        logger.info(f'Handle YT video ID={video_id}')
 
         try:
             duration = get_video_duration(youtube, video_id)
@@ -223,21 +249,21 @@ def handle_message(message, youtube):
                 }
             ).execute()
         except googleapiclient.errors.HttpError as e:
-            warnings.warn(f'  Broken: {video_id}\n{e}')
+            logger.warning(f'  Broken: {video_id}\n{e}')
             if e.status_code == 403:
                 raise
         except (VideoDoesNotExistError, InvalidDurationError) as e:
-            warnings.warn(f'Video duration parsing error:\n{e}')
+            logger.warning(f'Video duration parsing error:\n{e}')
 
     with TIMESTAMP_LOCK:
         with open(TIMESTAMP_PATH, 'r') as f:
             timestamp = f.read()
         message_timestamp = message['ts']
         if float(timestamp) > float(message_timestamp):
-            warnings.warn(f'{TIMESTAMP_PATH} contains timestamp={timestamp} '
-                          f'but message contains older timestamp '
-                          f'{message_timestamp}. This should never happen '
-                          f'and we will not update the timestamp in the file.')
+            logger.warning(f'{TIMESTAMP_PATH} contains timestamp={timestamp} '
+                           f'but message contains older timestamp '
+                           f'{message_timestamp}. This should never happen '
+                           f'and we will not update the timestamp in the file.')
         else:
             with open(TIMESTAMP_PATH, 'w') as f:
                 f.write(message_timestamp)
@@ -255,8 +281,11 @@ def main():
         # retrieve messages we have missed since last time the script was run
         missed_messages = retrieve_slack_history(slack, last_timestamp)
 
-        for message in missed_messages:
-            handle_message(message, youtube)
+        if missed_messages:
+            for message in missed_messages:
+                handle_message(message, youtube)
+        else:
+            logger.info('No new messages')
 
         time.sleep(10)
 
