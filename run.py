@@ -1,8 +1,5 @@
-# Sample Python code for youtube.channels.list
-# See instructions for running these code samples locally:
-# https://developers.google.com/explorer-help/code-samples#python
-
 import os
+import socket
 import time
 import threading
 import re
@@ -21,6 +18,11 @@ import googleapiclient.errors
 import slack_sdk
 from slack_sdk.errors import SlackApiError
 
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+
+from ytmusicapi import YTMusic
+
 OAUTH = True
 
 
@@ -29,17 +31,22 @@ def read_key(path):
         return f.read().strip()
 
 
-def read_client_secrets(path):
+def read_client_secrets(path, key=None):
     with open(path, 'r') as f:
-        data = json.load(f)['installed']
+        data = json.load(f)
+    if key:
+        data = data['installed']
     return data['client_id'], data['client_secret']
 
 
 GOOGLE_YT_DATA_API_KEY = read_key('google_api_key.txt')
 # CLIENT_SECRETS_FILE = 'google_client_secret.json'
 GOOGLE_APP_CLIENT_ID, GOOGLE_APP_CLIENT_SECRET = read_client_secrets(
-    'google_client_secret.json')
+    'google_client_secret.json', 'installed')
 YT_API_SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
+
+SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET = read_client_secrets(
+    'spotify_client_auth.json')
 
 SLACK_BOT_TOKEN = read_key('slack_bot_user_oauth_token.txt')
 SLACK_CHANNEL = 'C032LTMTP47'  # vibe-check
@@ -56,6 +63,7 @@ TIMESTAMP_PATH = 'latest_message_timestamp.txt'
 # https://www.youtube.com/watch?v=RanWHeHgH0k&list=PLzvmpzXLAkthyaiDbI6c_35KDZ1bu5Fp-&index=9
 # https://youtu.be/RanWHeHgH0k
 YT_REGEX = re.compile(r'(?:youtube\.com/watch\?v=|youtu\.be/)([\dA-Za-z_-]+)')
+SP_REGEX = re.compile(r'spotify\.com/track/([\dA-Za-z]+)')
 
 VIBE_CHECK_PLAYLIST_ID = 'PLzvmpzXLAktitNV3k0LguHX9s7_k3q1j0'
 VIBE_CHECK_PLAYLIST_ID_LONG = 'PLzvmpzXLAktiaojjoPTOJZ7E0WzpXkYmq'
@@ -100,6 +108,18 @@ def build_slack_client():
     return slack
 
 
+def build_spotify_client():
+    os.environ['SPOTIPY_CLIENT_ID'] = SPOTIFY_CLIENT_ID
+    os.environ['SPOTIPY_CLIENT_SECRET'] = SPOTIFY_CLIENT_SECRET
+    return spotipy.Spotify(
+        client_credentials_manager=SpotifyClientCredentials())
+
+
+def build_ytmusic_client():
+    ytmusic = YTMusic('yt_music_headers_auth.json')
+    return ytmusic
+
+
 def read_timestamp():
     with TIMESTAMP_LOCK:
         with open(TIMESTAMP_PATH, 'r') as f:
@@ -138,8 +158,17 @@ def retrieve_slack_history(slack, last_timestamp):
                 logger.error(f'Got an error: {e.response["error"]}')
                 raise e
         except urllib.error.URLError as e:
-            if re.match(r'timed out', e.reason):
+            print('e.reason', e.reason)
+            print('type(e.reason)', type(e.reason))
+            e_reason_str = str(e.reason)
+            if isinstance(e_reason_str, str) and re.match(
+                    r'timed out', e_reason_str):
                 logger.warning('Connection timed out, sleeping for a minute')
+                time.sleep(60)
+            elif (isinstance(e.reason, socket.gaierror) and
+                  re.match('[Tt]emporary failure', e_reason_str)):
+                logger.warning(f'Connection temporary failure: '
+                               f'{e.reason.args[0]}')
                 time.sleep(60)
             else:
                 raise e
@@ -224,8 +253,39 @@ def get_video_duration(youtube, video_id):
     return duration_secs
 
 
-def handle_message(message, youtube):
-    video_ids = YT_REGEX.findall(message['text'])
+SAFEWORD = 'orang'
+SAFEWORD_REGEX = re.compile(rf'(^|\s){SAFEWORD}($|\s)')
+
+
+def handle_message(message, youtube, spotify, ytmusic):
+    if SAFEWORD_REGEX.search(message['text']):
+        logger.info('Safeword detected in message! Will ignore video IDs '
+                    'within.')
+        track_ids_sp = []
+        video_ids = []
+    else:
+        track_ids_sp = SP_REGEX.findall(message['text'])
+        video_ids = YT_REGEX.findall(message['text'])
+
+    for track_id_sp in sorted(set(track_ids_sp)):
+        logger.info(f'Handle SP track ID={track_id_sp}')
+        track_info = spotify.track(track_id_sp)
+        yt_music_query = (
+                track_info['name'] + ', ' +
+                ' AND '.join(artist['name'] for artist in track_info['artists'])
+                + ', ' + track_info['album']['name']
+        )
+        ytm_search_results = ytmusic.search(yt_music_query)
+        for ytm_search_result in ytm_search_results:
+            if ytm_search_result['resultType'] != 'song':
+                continue
+            video_ids.append(ytm_search_result['videoId'])
+            break
+        else:
+            logger.info(f'Could not find a YouTube Music video corresponding '
+                        f'to the Spotify-derived query "{yt_music_query}" '
+                        f'(Spotify track ID {track_id_sp})')
+
     for video_id in sorted(set(video_ids)):  # unique video IDs
         logger.info(f'Handle YT video ID={video_id}')
 
@@ -275,6 +335,8 @@ def main():
 
     youtube = build_yt_client()
     slack = build_slack_client()
+    spotify = build_spotify_client()
+    ytmusic = build_ytmusic_client()
 
     while True:
         last_timestamp = read_timestamp()
@@ -283,11 +345,11 @@ def main():
 
         if missed_messages:
             for message in missed_messages:
-                handle_message(message, youtube)
+                handle_message(message, youtube, spotify, ytmusic)
         else:
             logger.info('No new messages')
 
-        time.sleep(10)
+        time.sleep(60)
 
 
 if __name__ == '__main__':

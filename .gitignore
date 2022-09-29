@@ -3,8 +3,11 @@ __pycache__/
 venv/
 .idea/
 *.json
+.cache
 
 google_client_secret.json
 google_api_key.txt
 slack_bot_user_oauth_token.txt
 latest_message_timestamp.txt
+yt_music_headers_auth.json
+spotify_client_auth.json
