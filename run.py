@@ -10,6 +10,8 @@ from decimal import Decimal
 
 import urllib.error
 
+from requests.exceptions import ConnectionError
+
 import pydata_google_auth
 import googleapiclient.discovery
 import googleapiclient.discovery_cache
@@ -269,7 +271,19 @@ def handle_message(message, youtube, spotify, ytmusic):
 
     for track_id_sp in sorted(set(track_ids_sp)):
         logger.info(f'Handle SP track ID={track_id_sp}')
-        track_info = spotify.track(track_id_sp)
+        spotify_request_retries = 10
+        for spotify_request_retry in range(spotify_request_retries):
+            try:
+                track_info = spotify.track(track_id_sp)
+            except ConnectionError:
+                continue
+            else:
+                break
+        else:
+            logger.error(f'Could not connect to spotify API after '
+                         f'{spotify_request_retry} retries to request '
+                         f'track {track_id_sp}')
+            raise RuntimeError('fuck')
         yt_music_query = (
                 track_info['name'] + ', ' +
                 ' AND '.join(artist['name'] for artist in track_info['artists'])
@@ -353,4 +367,8 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    while True:
+        try:
+            main()
+        except Exception:
+            logger.exception('Exception in main loop!')
