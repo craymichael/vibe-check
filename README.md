@@ -1,5 +1,7 @@
 # vibe-check (bot)
 
+Do you frequently share music with colleagues/friends over Slack? Then check out the Vibe Check bot! The bot monitors a channel(s) for links to music on YouTube and Spotify, then updates a YouTube playlist. Listen to all your space's music at one link!
+
 ```shell
 pip install -r requirements.txt
 python run.py
